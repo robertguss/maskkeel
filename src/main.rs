@@ -1,14 +1,17 @@
 mod config;
 mod engine;
 mod error;
+mod html;
 mod output;
+mod parquet_io;
 mod pipeline;
 mod skill;
 
 use crate::config::{MaskConfig, render_mask_toml};
 use crate::error::MaskkeelError;
+use crate::html::render_verify_html;
 use crate::output::{OutputFormat, print_error, print_mask, print_scan, print_verify};
-use crate::pipeline::{mask_source, scan_source, verify_masking};
+use crate::pipeline::{MaskOptions, mask_source, scan_source, verify_masking};
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
@@ -31,7 +34,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Scan a file, SQLite DB, or PostgreSQL DB for PII/FERPA columns and optionally write a starter mask.toml.
+    /// Scan a file, SQLite DB, or PostgreSQL DB for PII/FERPA columns (including embedded PII in free-text/JSONB) and optionally write a starter mask.toml.
     Scan {
         /// Input path (.csv, .tsv, .jsonl, .parquet, sqlite:///path.db, postgres://...)
         source: String,
@@ -49,7 +52,7 @@ enum Commands {
         init_config: Option<String>,
     },
 
-    /// Deterministically scrub PII from input -> output (refuses in-place overwrites).
+    /// Deterministically scrub PII from input -> output (refuses in-place overwrites; supports FK-coherent subsetting).
     Mask {
         /// Input path or DB URL (.csv, .tsv, .jsonl, .parquet, sqlite://..., postgres://...)
         input: String,
@@ -84,14 +87,22 @@ enum Commands {
         /// Comma-separated PostgreSQL schema names to migrate & mask (defaults to all non-system schemas).
         #[arg(long, value_delimiter = ',')]
         schema: Vec<String>,
+
+        /// Maximum rows to keep per root table/file (child tables with FKs automatically keep only rows referencing sampled parent keys).
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Deterministic percentage of root rows to sample (0 < pct <= 100; FK-coherent for child tables).
+        #[arg(long)]
+        sample: Option<f64>,
     },
 
-    /// Audit a masked dataset against the original for zero PII leaks, row-count parity, and key cardinality.
+    /// Audit a masked dataset against the original for zero PII leaks, row-count parity, key cardinality, and optional HTML compliance receipt.
     Verify {
-        /// Original source (.csv, sqlite://..., postgres://...)
+        /// Original source (.csv, .parquet, sqlite://..., postgres://...)
         original: String,
 
-        /// Masked output (.csv, sqlite://..., postgres://...)
+        /// Masked output (.csv, .parquet, sqlite://..., postgres://...)
         masked: String,
 
         /// Optional mask.toml (respects explicit `keep` exemptions and custom masked columns).
@@ -101,6 +112,14 @@ enum Commands {
         /// Comma-separated PostgreSQL schema names to verify.
         #[arg(long, value_delimiter = ',')]
         schema: Vec<String>,
+
+        /// Allow masked output to be a subset of original rows (use when `mask` ran with `--limit` or `--sample`).
+        #[arg(long)]
+        allow_subset: bool,
+
+        /// Write a self-contained offline HTML compliance verification receipt to this path.
+        #[arg(long)]
+        html: Option<String>,
     },
 
     /// Print the bundled AI agent SKILL.md or install it into a directory (e.g. .agents/skills/maskkeel).
@@ -152,7 +171,17 @@ fn run(cli: Cli) -> crate::error::Result<ExitCode> {
             email_domain,
             date_shift_days,
             schema,
+            limit,
+            sample,
         } => {
+            if let Some(pct) = sample
+                && (!(0.0..=100.0).contains(&pct) || pct <= 0.0)
+            {
+                return Err(MaskkeelError::config(
+                    format!("Invalid --sample percentage `{pct}`"),
+                    "Provide a value strictly greater than 0 and at most 100 (e.g. `--sample 10`).",
+                ));
+            }
             let effective_salt = match salt.filter(|s| !s.trim().is_empty()) {
                 Some(s) => s,
                 None if require_salt => {
@@ -180,8 +209,13 @@ fn run(cli: Cli) -> crate::error::Result<ExitCode> {
                 cfg.date_shift_days = Some(days);
             }
 
-            let auto_detect = auto || config.is_none();
-            let report = mask_source(&input, &output, &cfg, auto_detect, &effective_salt, &schema)?;
+            let opts = MaskOptions {
+                auto_detect: auto || config.is_none(),
+                schemas: schema,
+                limit,
+                sample_pct: sample,
+            };
+            let report = mask_source(&input, &output, &cfg, &opts, &effective_salt)?;
             print_mask(&report, fmt);
             Ok(ExitCode::SUCCESS)
         }
@@ -191,13 +225,19 @@ fn run(cli: Cli) -> crate::error::Result<ExitCode> {
             masked,
             config,
             schema,
+            allow_subset,
+            html,
         } => {
             let cfg = match &config {
                 Some(path) => Some(MaskConfig::load(path)?),
                 None => None,
             };
-            let report = verify_masking(&original, &masked, cfg.as_ref(), &schema)?;
-            print_verify(&report, fmt);
+            let report = verify_masking(&original, &masked, cfg.as_ref(), &schema, allow_subset)?;
+            if let Some(ref html_path) = html {
+                let body = render_verify_html(&report);
+                std::fs::write(html_path, body).map_err(|e| MaskkeelError::io(e, html_path))?;
+            }
+            print_verify(&report, html.as_deref(), fmt);
             if report.ok {
                 Ok(ExitCode::SUCCESS)
             } else {

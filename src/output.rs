@@ -140,8 +140,12 @@ pub fn print_mask(report: &MaskReport, fmt: OutputFormat) {
         }
         OutputFormat::Agent => {
             println!(
-                "# maskkeel mask | ok={} | tables={} | rows={} | masked_cols={}",
-                report.ok, report.tables_masked, report.total_rows, report.total_masked_columns
+                "# maskkeel mask | ok={} | tables={} | rows={} | masked_cols={} | salt_fp={}",
+                report.ok,
+                report.tables_masked,
+                report.total_rows,
+                report.total_masked_columns,
+                report.salt_fingerprint
             );
             println!("output: {}", report.output);
             println!("| table | rows | masked_columns |");
@@ -157,11 +161,12 @@ pub fn print_mask(report: &MaskReport, fmt: OutputFormat) {
         }
         OutputFormat::Human | OutputFormat::Auto => {
             println!(
-                "{} Masked {} table(s), {} row(s), {} PII column(s) -> {}",
+                "{} Masked {} table(s), {} row(s), {} PII column(s) [salt_fp: {}] -> {}",
                 "✓".green().bold(),
                 report.tables_masked,
                 report.total_rows,
                 report.total_masked_columns,
+                report.salt_fingerprint.dimmed(),
                 report.output.bold()
             );
             for t in &report.tables {
@@ -181,7 +186,7 @@ pub fn print_mask(report: &MaskReport, fmt: OutputFormat) {
     }
 }
 
-pub fn print_verify(report: &VerifyReport, fmt: OutputFormat) {
+pub fn print_verify(report: &VerifyReport, html_out: Option<&str>, fmt: OutputFormat) {
     match fmt.resolve() {
         OutputFormat::Json => {
             println!(
@@ -199,6 +204,20 @@ pub fn print_verify(report: &VerifyReport, fmt: OutputFormat) {
                 report.key_cardinality_preserved,
                 report.pii_leaks_found
             );
+            if !report.table_results.is_empty() {
+                println!("| table | orig_rows | masked_rows | pii_cols | leaks |");
+                println!("|---|---:|---:|---:|---:|");
+                for t in &report.table_results {
+                    println!(
+                        "| {} | {} | {} | {} | {} |",
+                        t.table,
+                        t.original_rows,
+                        t.masked_rows,
+                        t.pii_columns_checked,
+                        t.leaked_values
+                    );
+                }
+            }
             for n in &report.notes {
                 println!("- note: {n}");
             }
@@ -208,6 +227,9 @@ pub fn print_verify(report: &VerifyReport, fmt: OutputFormat) {
                 for l in &report.leaks {
                     println!("| {} | {} | {} |", l.table, l.column, l.leaked_count);
                 }
+            }
+            if let Some(p) = html_out {
+                println!("\nCompliance receipt HTML: `{p}`");
             }
         }
         OutputFormat::Human | OutputFormat::Auto => {
@@ -228,6 +250,16 @@ pub fn print_verify(report: &VerifyReport, fmt: OutputFormat) {
                     report.tables_checked
                 );
             }
+            for t in &report.table_results {
+                println!(
+                    "  • {}: {}/{} rows, {} PII col(s), {} leak(s)",
+                    t.table.cyan(),
+                    t.masked_rows,
+                    t.original_rows,
+                    t.pii_columns_checked,
+                    t.leaked_values
+                );
+            }
             for n in &report.notes {
                 println!("  {} {}", "!".yellow().bold(), n);
             }
@@ -238,6 +270,13 @@ pub fn print_verify(report: &VerifyReport, fmt: OutputFormat) {
                     l.table.bold(),
                     l.column.cyan(),
                     l.leaked_count
+                );
+            }
+            if let Some(p) = html_out {
+                println!(
+                    "  {} Wrote compliance receipt HTML -> {}",
+                    "✓".green().bold(),
+                    p.bold()
                 );
             }
         }

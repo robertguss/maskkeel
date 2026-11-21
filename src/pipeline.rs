@@ -1,6 +1,8 @@
 use crate::config::{MaskConfig, ScannedColumn, detection_to_scanned};
-use crate::engine::{MaskEngine, MaskStrategy, detect_column_pii};
+use crate::engine::{MaskEngine, MaskStrategy, detect_column_pii, extract_embedded_pii_tokens};
 use crate::error::{MaskkeelError, Result};
+use crate::parquet_io::{mask_parquet_to_parquet, verify_parquet};
+use chrono::Utc;
 use indexmap::IndexSet;
 use native_tls::TlsConnector;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -12,11 +14,19 @@ use rusqlite::{
     types::{Value as SqlVal, ValueRef},
 };
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use url::Url;
+
+#[derive(Debug, Clone, Default)]
+pub struct MaskOptions {
+    pub auto_detect: bool,
+    pub schemas: Vec<String>,
+    pub limit: Option<usize>,
+    pub sample_pct: Option<f64>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanReport {
@@ -39,6 +49,7 @@ pub struct MaskReport {
     pub ok: bool,
     pub input: String,
     pub output: String,
+    pub salt_fingerprint: String,
     pub tables_masked: usize,
     pub total_rows: usize,
     pub total_masked_columns: usize,
@@ -53,14 +64,25 @@ pub struct LeakDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TableVerifySummary {
+    pub table: String,
+    pub original_rows: usize,
+    pub masked_rows: usize,
+    pub pii_columns_checked: usize,
+    pub leaked_values: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct VerifyReport {
     pub ok: bool,
+    pub verified_at: String,
     pub original: String,
     pub masked: String,
     pub tables_checked: usize,
     pub row_counts_matched: bool,
     pub key_cardinality_preserved: bool,
     pub pii_leaks_found: usize,
+    pub table_results: Vec<TableVerifySummary>,
     pub leaks: Vec<LeakDetail>,
     pub notes: Vec<String>,
 }
@@ -81,8 +103,28 @@ pub fn is_sqlite(spec: &str) -> bool {
         || low.ends_with(".sqlite3")
 }
 
+fn is_parquet(spec: &str) -> bool {
+    let low = spec.to_ascii_lowercase();
+    low.ends_with(".parquet") || low.ends_with(".pq")
+}
+
 fn sqlite_path(spec: &str) -> &str {
     spec.strip_prefix("sqlite://").unwrap_or(spec)
+}
+
+fn should_keep_sample(row_idx: usize, sample_pct: Option<f64>) -> bool {
+    let Some(pct) = sample_pct else {
+        return true;
+    };
+    if pct >= 100.0 {
+        return true;
+    }
+    // Deterministic 10_000-bucket hash so repeated runs sample the exact same rows
+    let h = (row_idx as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let bucket = (h >> 16) % 10_000;
+    (bucket as f64) < (pct * 100.0)
 }
 
 fn connect_postgres(db_url: &str) -> Result<PgClient> {
@@ -154,7 +196,7 @@ pub fn scan_source(source: &str, schemas: &[String], sample_rows: usize) -> Resu
                 pii_columns_found: findings.len(),
                 findings,
             })
-        } else if lower.ends_with(".parquet") || lower.ends_with(".pq") {
+        } else if is_parquet(source) {
             let findings = scan_parquet(source, &tname, limit)?;
             Ok(ScanReport {
                 source: source.to_string(),
@@ -255,7 +297,7 @@ fn scan_jsonl(path: &str, tname: &str, limit: usize) -> Result<Vec<ScannedColumn
     Ok(findings)
 }
 
-fn scan_parquet(path: &str, tname: &str, limit: usize) -> Result<Vec<ScannedColumn>> {
+pub fn scan_parquet(path: &str, tname: &str, limit: usize) -> Result<Vec<ScannedColumn>> {
     let file = File::open(path).map_err(|e| MaskkeelError::io(e, path))?;
     let reader = SerializedFileReader::new(file)
         .map_err(|e| MaskkeelError::parse(format!("Parquet error: {e}"), ""))?;
@@ -380,15 +422,14 @@ fn scan_postgres(db_url: &str, schemas: &[String], limit: usize) -> Result<ScanR
     })
 }
 
-// ── MASK (File->File, SQLite->SQLite, Postgres->Postgres) ─────────────────────
+// ── MASK (File->File, Parquet->Parquet/JSONL, SQLite->SQLite, Postgres->Postgres) ──
 
 pub fn mask_source(
     input: &str,
     output: &str,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     salt: &str,
-    schemas: &[String],
 ) -> Result<MaskReport> {
     // Hard safety check: NEVER overwrite input in place!
     if input.trim() == output.trim() {
@@ -405,9 +446,9 @@ pub fn mask_source(
     );
 
     if is_pg(input) && is_pg(output) {
-        mask_postgres(input, output, config, auto_detect, &engine, schemas)
+        mask_postgres(input, output, config, opts, &engine)
     } else if is_sqlite(input) && is_sqlite(output) {
-        mask_sqlite(input, output, config, auto_detect, &engine)
+        mask_sqlite(input, output, config, opts, &engine)
     } else {
         let lower_in = input.to_ascii_lowercase();
         if lower_in.ends_with(".csv") || lower_in.ends_with(".tsv") {
@@ -416,15 +457,26 @@ pub fn mask_source(
             } else {
                 b','
             };
-            mask_delimited_file(input, output, delim, config, auto_detect, &engine)
+            mask_delimited_file(input, output, delim, config, opts, &engine)
         } else if lower_in.ends_with(".jsonl") || lower_in.ends_with(".ndjson") {
-            mask_jsonl_file(input, output, config, auto_detect, &engine)
-        } else if lower_in.ends_with(".parquet") || lower_in.ends_with(".pq") {
-            mask_parquet_to_jsonl(input, output, config, auto_detect, &engine)
+            mask_jsonl_file(input, output, config, opts, &engine)
+        } else if is_parquet(input) {
+            if is_parquet(output) {
+                mask_parquet_to_parquet(
+                    input,
+                    output,
+                    config,
+                    opts.auto_detect,
+                    &engine,
+                    opts.limit,
+                )
+            } else {
+                mask_parquet_to_jsonl(input, output, config, opts, &engine)
+            }
         } else {
             Err(MaskkeelError::config(
                 format!("Unsupported input/output pair `{input}` -> `{output}`"),
-                "Supported: CSV->CSV, TSV->TSV, JSONL->JSONL, Parquet->JSONL, SQLite->SQLite, Postgres->Postgres.",
+                "Supported: CSV->CSV, TSV->TSV, JSONL->JSONL, Parquet->Parquet/JSONL, SQLite->SQLite, Postgres->Postgres.",
             ))
         }
     }
@@ -435,7 +487,7 @@ fn mask_delimited_file(
     output: &str,
     delim: u8,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     engine: &MaskEngine,
 ) -> Result<MaskReport> {
     let tname = Path::new(input)
@@ -445,7 +497,7 @@ fn mask_delimited_file(
         .to_string();
 
     let mut auto_map: HashMap<String, MaskStrategy> = HashMap::new();
-    if auto_detect {
+    if opts.auto_detect {
         for f in scan_delimited(input, delim, &tname, 200)? {
             auto_map.insert(f.column.to_ascii_lowercase(), f.recommended_strategy);
         }
@@ -488,8 +540,16 @@ fn mask_delimited_file(
         .map_err(|e| MaskkeelError::io(e, output))?;
 
     let mut rows_processed = 0usize;
-    for rec in rdr.records() {
+    for (row_idx, rec) in rdr.records().enumerate() {
+        if let Some(lim) = opts.limit
+            && rows_processed >= lim
+        {
+            break;
+        }
         let rec = rec.map_err(|e| MaskkeelError::parse(e.to_string(), ""))?;
+        if !should_keep_sample(row_idx, opts.sample_pct) {
+            continue;
+        }
         let mut out_row = Vec::with_capacity(headers.len());
         for (i, &strat) in strategies.iter().enumerate() {
             let raw = rec.get(i).unwrap_or("");
@@ -509,6 +569,7 @@ fn mask_delimited_file(
         ok: true,
         input: input.to_string(),
         output: output.to_string(),
+        salt_fingerprint: engine.salt_fingerprint(),
         tables_masked: 1,
         total_rows: rows_processed,
         total_masked_columns: masked_columns.len(),
@@ -524,7 +585,7 @@ fn mask_jsonl_file(
     input: &str,
     output: &str,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     engine: &MaskEngine,
 ) -> Result<MaskReport> {
     let tname = Path::new(input)
@@ -534,7 +595,7 @@ fn mask_jsonl_file(
         .to_string();
 
     let mut auto_map: HashMap<String, MaskStrategy> = HashMap::new();
-    if auto_detect {
+    if opts.auto_detect {
         for f in scan_jsonl(input, &tname, 200)? {
             auto_map.insert(f.column.to_ascii_lowercase(), f.recommended_strategy);
         }
@@ -548,10 +609,15 @@ fn mask_jsonl_file(
     let mut rows_processed = 0usize;
     let mut masked_cols_seen: IndexSet<String> = IndexSet::new();
 
-    for line in rdr.lines() {
+    for (row_idx, line) in rdr.lines().enumerate() {
+        if let Some(lim) = opts.limit
+            && rows_processed >= lim
+        {
+            break;
+        }
         let line = line.map_err(|e| MaskkeelError::io(e, input))?;
         let t = line.trim();
-        if t.is_empty() {
+        if t.is_empty() || !should_keep_sample(row_idx, opts.sample_pct) {
             continue;
         }
         let mut val: serde_json::Value =
@@ -580,6 +646,7 @@ fn mask_jsonl_file(
         ok: true,
         input: input.to_string(),
         output: output.to_string(),
+        salt_fingerprint: engine.salt_fingerprint(),
         tables_masked: 1,
         total_rows: rows_processed,
         total_masked_columns: masked_columns.len(),
@@ -595,7 +662,7 @@ fn mask_parquet_to_jsonl(
     input: &str,
     output: &str,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     engine: &MaskEngine,
 ) -> Result<MaskReport> {
     let tname = Path::new(input)
@@ -605,7 +672,7 @@ fn mask_parquet_to_jsonl(
         .to_string();
 
     let mut auto_map: HashMap<String, MaskStrategy> = HashMap::new();
-    if auto_detect {
+    if opts.auto_detect {
         for f in scan_parquet(input, &tname, 200)? {
             auto_map.insert(f.column.to_ascii_lowercase(), f.recommended_strategy);
         }
@@ -623,8 +690,16 @@ fn mask_parquet_to_jsonl(
     let mut rows_processed = 0usize;
     let mut masked_cols_seen: IndexSet<String> = IndexSet::new();
 
-    for row_res in iter {
+    for (row_idx, row_res) in iter.enumerate() {
+        if let Some(lim) = opts.limit
+            && rows_processed >= lim
+        {
+            break;
+        }
         let rec = row_res.map_err(|e| MaskkeelError::parse(e.to_string(), ""))?;
+        if !should_keep_sample(row_idx, opts.sample_pct) {
+            continue;
+        }
         let mut obj = serde_json::Map::new();
         for (name, field) in rec.get_column_iter() {
             let mut jv = parquet_field_json(field);
@@ -653,6 +728,7 @@ fn mask_parquet_to_jsonl(
         ok: true,
         input: input.to_string(),
         output: output.to_string(),
+        salt_fingerprint: engine.salt_fingerprint(),
         tables_masked: 1,
         total_rows: rows_processed,
         total_masked_columns: masked_columns.len(),
@@ -664,11 +740,72 @@ fn mask_parquet_to_jsonl(
     })
 }
 
+// ── Topological FK ordering helper (parents before children) ──────────────────
+
+#[derive(Debug, Clone)]
+struct FkEdge {
+    child_table: String,
+    child_col: String,
+    parent_table: String,
+    parent_col: String,
+}
+
+fn topo_sort_tables(tables: &[String], fks: &[FkEdge]) -> Vec<String> {
+    let table_set: HashSet<String> = tables.iter().cloned().collect();
+    let mut in_degree: HashMap<String, usize> = tables.iter().map(|t| (t.clone(), 0)).collect();
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+
+    for fk in fks {
+        if fk.child_table == fk.parent_table {
+            continue;
+        }
+        if table_set.contains(&fk.child_table) && table_set.contains(&fk.parent_table) {
+            let entry = dependents.entry(fk.parent_table.clone()).or_default();
+            if !entry.contains(&fk.child_table) {
+                entry.push(fk.child_table.clone());
+                *in_degree.entry(fk.child_table.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut queue: VecDeque<String> = tables
+        .iter()
+        .filter(|t| *in_degree.get(*t).unwrap_or(&0) == 0)
+        .cloned()
+        .collect();
+    let mut ordered = Vec::with_capacity(tables.len());
+    let mut seen: HashSet<String> = HashSet::new();
+
+    while let Some(t) = queue.pop_front() {
+        if !seen.insert(t.clone()) {
+            continue;
+        }
+        ordered.push(t.clone());
+        if let Some(children) = dependents.get(&t) {
+            for c in children {
+                if let Some(deg) = in_degree.get_mut(c) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        queue.push_back(c.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Append any cycle participants deterministically
+    for t in tables {
+        if seen.insert(t.clone()) {
+            ordered.push(t.clone());
+        }
+    }
+    ordered
+}
+
 fn mask_sqlite(
     input: &str,
     output: &str,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     engine: &MaskEngine,
 ) -> Result<MaskReport> {
     let in_path = sqlite_path(input);
@@ -684,7 +821,7 @@ fn mask_sqlite(
     let _ = dst.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA journal_mode = WAL;");
 
     let mut auto_map: HashMap<(String, String), MaskStrategy> = HashMap::new();
-    if auto_detect {
+    if opts.auto_detect {
         let scan = scan_sqlite(input, 200)?;
         for f in scan.findings {
             auto_map.insert(
@@ -698,23 +835,60 @@ fn mask_sqlite(
     let mut ddl_stmt = src
         .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY name")
         .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?;
-    let table_ddls: Vec<(String, String)> = ddl_stmt
+    let ddl_map: HashMap<String, String> = ddl_stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?
         .filter_map(|r| r.ok())
         .collect();
 
-    for (_, sql) in &table_ddls {
-        dst.execute(sql, [])
-            .map_err(|e| MaskkeelError::db(format!("Failed creating table: {e}"), "", false))?;
+    let mut table_names: Vec<String> = ddl_map.keys().cloned().collect();
+    table_names.sort();
+
+    // Collect SQLite foreign keys for FK-coherent topological ordering & subsetting
+    let mut fks = Vec::new();
+    for tbl in &table_names {
+        if let Ok(mut st) = src.prepare(&format!("PRAGMA foreign_key_list({})", qid(tbl)))
+            && let Ok(rows) = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(2)?, // ref_table
+                    r.get::<_, String>(3)?, // from_col
+                    r.get::<_, String>(4)?, // to_col
+                ))
+            })
+        {
+            for (ref_tbl, from_col, to_col) in rows.flatten() {
+                fks.push(FkEdge {
+                    child_table: tbl.clone(),
+                    child_col: from_col,
+                    parent_table: ref_tbl,
+                    parent_col: to_col,
+                });
+            }
+        }
     }
 
-    // 2. Copy & mask every table's rows inside transactions!
+    let ordered_tables = topo_sort_tables(&table_names, &fks);
+    for tbl in &ordered_tables {
+        if let Some(sql) = ddl_map.get(tbl) {
+            dst.execute(sql, []).map_err(|e| {
+                MaskkeelError::db(format!("Failed creating table `{tbl}`: {e}"), "", false)
+            })?;
+        }
+    }
+
+    let subsetting = opts.limit.is_some() || opts.sample_pct.is_some();
+    let referenced_cols: HashSet<(String, String)> = fks
+        .iter()
+        .map(|f| (f.parent_table.clone(), f.parent_col.to_ascii_lowercase()))
+        .collect();
+    let mut kept_parent_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
+
+    // 2. Copy & mask tables in topological parent -> child order!
     let mut summaries = Vec::new();
     let mut total_rows = 0usize;
     let mut total_masked_cols = 0usize;
 
-    for (tbl, _) in &table_ddls {
+    for tbl in &ordered_tables {
         let cols = sqlite_table_cols(&src, tbl)?;
         let strategies: Vec<MaskStrategy> = cols
             .iter()
@@ -738,6 +912,16 @@ fn mask_sqlite(
             .collect();
         total_masked_cols += masked_columns.len();
 
+        let incoming_fks: Vec<&FkEdge> = fks
+            .iter()
+            .filter(|f| f.child_table == *tbl && f.parent_table != *tbl)
+            .collect();
+        let has_sampled_parent = subsetting
+            && incoming_fks.iter().any(|f| {
+                kept_parent_keys
+                    .contains_key(&(f.parent_table.clone(), f.parent_col.to_ascii_lowercase()))
+            });
+
         let col_q: Vec<String> = cols.iter().map(|(c, _)| qid(c)).collect();
         let placeholders: Vec<&str> = vec!["?"; cols.len()];
         let ins_sql = format!(
@@ -752,6 +936,7 @@ fn mask_sqlite(
             .transaction()
             .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?;
         let mut rows_processed = 0usize;
+        let mut raw_row_idx = 0usize;
         {
             let mut ins = tx
                 .prepare(&ins_sql)
@@ -766,6 +951,53 @@ fn mask_sqlite(
                 .next()
                 .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?
             {
+                let cur_idx = raw_row_idx;
+                raw_row_idx += 1;
+
+                if subsetting {
+                    if has_sampled_parent {
+                        // Keep row ONLY if every non-null FK references a kept parent key!
+                        let mut fk_ok = true;
+                        for fk in &incoming_fks {
+                            if let Some(pkeys) = kept_parent_keys
+                                .get(&(fk.parent_table.clone(), fk.parent_col.to_ascii_lowercase()))
+                                && let Some(ci) = cols
+                                    .iter()
+                                    .position(|(c, _)| c.eq_ignore_ascii_case(&fk.child_col))
+                                && let Some(raw_fk) = sqlite_val_key(r.get_ref_unwrap(ci))
+                                && !pkeys.contains(&raw_fk)
+                            {
+                                fk_ok = false;
+                                break;
+                            }
+                        }
+                        if !fk_ok {
+                            continue;
+                        }
+                    } else {
+                        if let Some(lim) = opts.limit
+                            && rows_processed >= lim
+                        {
+                            break;
+                        }
+                        if !should_keep_sample(cur_idx, opts.sample_pct) {
+                            continue;
+                        }
+                    }
+                }
+
+                // Record kept raw keys if downstream child tables reference this table
+                if subsetting {
+                    for (ci, (cname, _)) in cols.iter().enumerate() {
+                        let key = (tbl.clone(), cname.to_ascii_lowercase());
+                        if referenced_cols.contains(&key)
+                            && let Some(raw_k) = sqlite_val_key(r.get_ref_unwrap(ci))
+                        {
+                            kept_parent_keys.entry(key).or_default().insert(raw_k);
+                        }
+                    }
+                }
+
                 let mut params: Vec<SqlVal> = Vec::with_capacity(cols.len());
                 for (i, &strat) in strategies.iter().enumerate() {
                     let v = match r.get_ref_unwrap(i) {
@@ -847,6 +1079,7 @@ fn mask_sqlite(
         ok: true,
         input: in_path.to_string(),
         output: out_path.to_string(),
+        salt_fingerprint: engine.salt_fingerprint(),
         tables_masked: summaries.len(),
         total_rows,
         total_masked_columns: total_masked_cols,
@@ -854,17 +1087,26 @@ fn mask_sqlite(
     })
 }
 
+fn sqlite_val_key(vr: ValueRef<'_>) -> Option<String> {
+    match vr {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        ValueRef::Blob(_) => None,
+    }
+}
+
 fn mask_postgres(
     src_url: &str,
     dst_url: &str,
     config: &MaskConfig,
-    auto_detect: bool,
+    opts: &MaskOptions,
     engine: &MaskEngine,
-    schemas: &[String],
 ) -> Result<MaskReport> {
     let mut auto_map: HashMap<(String, String), MaskStrategy> = HashMap::new();
-    if auto_detect {
-        let scan = scan_postgres(src_url, schemas, 200)?;
+    if opts.auto_detect {
+        let scan = scan_postgres(src_url, &opts.schemas, 200)?;
         for f in scan.findings {
             auto_map.insert(
                 (f.table.to_ascii_lowercase(), f.column.to_ascii_lowercase()),
@@ -882,37 +1124,28 @@ fn mask_postgres(
         .start()
         .map_err(|e| MaskkeelError::db(e.to_string(), "", true))?;
 
-    let tables = pg_list_tables(&mut src_tx, schemas)?;
-    let mut summaries = Vec::new();
-    let mut total_rows = 0usize;
-    let mut total_masked_cols = 0usize;
+    let raw_tables = pg_list_tables(&mut src_tx, &opts.schemas)?;
+    let qnames: Vec<String> = raw_tables.iter().map(|(s, t)| format!("{s}.{t}")).collect();
+    let table_split: HashMap<String, (String, String)> = raw_tables
+        .iter()
+        .map(|(s, t)| (format!("{s}.{t}"), (s.clone(), t.clone())))
+        .collect();
 
-    for (sch, tbl) in &tables {
-        let qname = format!("{sch}.{tbl}");
+    let pg_fks = pg_list_fks(&mut src_tx, &opts.schemas)?;
+    let ordered_qnames = topo_sort_tables(&qnames, &pg_fks);
+
+    let subsetting = opts.limit.is_some() || opts.sample_pct.is_some();
+    let referenced_cols: HashSet<(String, String)> = pg_fks
+        .iter()
+        .map(|f| (f.parent_table.clone(), f.parent_col.to_ascii_lowercase()))
+        .collect();
+    let mut kept_parent_keys: HashMap<(String, String), HashSet<String>> = HashMap::new();
+
+    // Pre-create schemas & tables (drop children first via CASCADE safely)
+    let mut table_cols_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for qname in &ordered_qnames {
+        let (sch, tbl) = &table_split[qname];
         let cols = pg_table_cols(&mut src_tx, sch, tbl)?;
-        let strategies: Vec<MaskStrategy> = cols
-            .iter()
-            .map(|(cname, _)| {
-                config
-                    .resolve_strategy(&qname, cname)
-                    .or_else(|| {
-                        auto_map
-                            .get(&(qname.to_ascii_lowercase(), cname.to_ascii_lowercase()))
-                            .copied()
-                    })
-                    .unwrap_or(MaskStrategy::Keep)
-            })
-            .collect();
-
-        let masked_columns: Vec<String> = cols
-            .iter()
-            .zip(strategies.iter())
-            .filter(|(_, s)| **s != MaskStrategy::Keep)
-            .map(|((c, _), s)| format!("{c}:{}", s.as_str()))
-            .collect();
-        total_masked_cols += masked_columns.len();
-
-        // Create schema & table cleanly in destination Postgres
         dst_client
             .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {};", qid(sch)))
             .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?;
@@ -932,8 +1165,48 @@ fn mask_postgres(
             .map_err(|e| {
                 MaskkeelError::db(format!("CREATE TABLE {qname} failed: {e}"), "", false)
             })?;
+        table_cols_map.insert(qname.clone(), cols);
+    }
 
-        // Stream via row_to_json from read-only src -> masked CSV COPY into dst!
+    let mut summaries = Vec::new();
+    let mut total_rows = 0usize;
+    let mut total_masked_cols = 0usize;
+
+    for qname in &ordered_qnames {
+        let (sch, tbl) = &table_split[qname];
+        let cols = &table_cols_map[qname];
+        let strategies: Vec<MaskStrategy> = cols
+            .iter()
+            .map(|(cname, _)| {
+                config
+                    .resolve_strategy(qname, cname)
+                    .or_else(|| {
+                        auto_map
+                            .get(&(qname.to_ascii_lowercase(), cname.to_ascii_lowercase()))
+                            .copied()
+                    })
+                    .unwrap_or(MaskStrategy::Keep)
+            })
+            .collect();
+
+        let masked_columns: Vec<String> = cols
+            .iter()
+            .zip(strategies.iter())
+            .filter(|(_, s)| **s != MaskStrategy::Keep)
+            .map(|((c, _), s)| format!("{c}:{}", s.as_str()))
+            .collect();
+        total_masked_cols += masked_columns.len();
+
+        let incoming_fks: Vec<&FkEdge> = pg_fks
+            .iter()
+            .filter(|f| f.child_table == *qname && f.parent_table != *qname)
+            .collect();
+        let has_sampled_parent = subsetting
+            && incoming_fks.iter().any(|f| {
+                kept_parent_keys
+                    .contains_key(&(f.parent_table.clone(), f.parent_col.to_ascii_lowercase()))
+            });
+
         let src_rows = src_tx
             .query(
                 &format!(
@@ -958,11 +1231,52 @@ fn mask_postgres(
         let mut buf = BufWriter::new(cw);
         let mut rows_processed = 0usize;
 
-        for r in src_rows {
+        for (raw_idx, r) in src_rows.into_iter().enumerate() {
             let js: String = r.get(0);
             let obj: serde_json::Value =
                 serde_json::from_str(&js).map_err(|e| MaskkeelError::parse(e.to_string(), ""))?;
             let map = obj.as_object();
+
+            if subsetting {
+                if has_sampled_parent {
+                    let mut fk_ok = true;
+                    for fk in &incoming_fks {
+                        if let Some(pkeys) = kept_parent_keys
+                            .get(&(fk.parent_table.clone(), fk.parent_col.to_ascii_lowercase()))
+                            && let Some(v) = map.and_then(|m| m.get(&fk.child_col))
+                            && let Some(raw_fk) = json_val_key(v)
+                            && !pkeys.contains(&raw_fk)
+                        {
+                            fk_ok = false;
+                            break;
+                        }
+                    }
+                    if !fk_ok {
+                        continue;
+                    }
+                } else {
+                    if let Some(lim) = opts.limit
+                        && rows_processed >= lim
+                    {
+                        break;
+                    }
+                    if !should_keep_sample(raw_idx, opts.sample_pct) {
+                        continue;
+                    }
+                }
+
+                // Record kept parent raw keys for downstream child tables
+                for (cname, _) in cols {
+                    let key = (qname.clone(), cname.to_ascii_lowercase());
+                    if referenced_cols.contains(&key)
+                        && let Some(v) = map.and_then(|m| m.get(cname))
+                        && let Some(raw_k) = json_val_key(v)
+                    {
+                        kept_parent_keys.entry(key).or_default().insert(raw_k);
+                    }
+                }
+            }
+
             for (i, ((cname, _), &strat)) in cols.iter().zip(strategies.iter()).enumerate() {
                 if i > 0 {
                     buf.write_all(b",")
@@ -995,17 +1309,21 @@ fn mask_postgres(
 
         total_rows += rows_processed;
         summaries.push(TableMaskSummary {
-            table: qname,
+            table: qname.clone(),
             rows_processed,
             masked_columns,
         });
     }
+
+    // Preserve PKs, UNIQUE constraints, secondary indexes, FKs, and identity/serial sequences!
+    pg_apply_constraints_and_indexes(&mut src_tx, &mut dst_client, &ordered_qnames, &table_split)?;
 
     let _ = src_tx.rollback();
     Ok(MaskReport {
         ok: true,
         input: "postgres (source)".to_string(),
         output: "postgres (target)".to_string(),
+        salt_fingerprint: engine.salt_fingerprint(),
         tables_masked: summaries.len(),
         total_rows,
         total_masked_columns: total_masked_cols,
@@ -1013,55 +1331,243 @@ fn mask_postgres(
     })
 }
 
-// ── VERIFY (Zero-Leak PII Audit + Row/Cardinality Parity) ─────────────────────
+fn json_val_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn pg_list_fks(tx: &mut postgres::Transaction, schemas: &[String]) -> Result<Vec<FkEdge>> {
+    let rows = tx
+        .query(
+            "SELECT
+                cn.nspname AS child_schema,
+                cc.relname AS child_table,
+                ca.attname AS child_col,
+                pn.nspname AS parent_schema,
+                pc.relname AS parent_table,
+                pa.attname AS parent_col
+             FROM pg_catalog.pg_constraint con
+             JOIN pg_catalog.pg_class cc ON cc.oid = con.conrelid
+             JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace
+             JOIN pg_catalog.pg_class pc ON pc.oid = con.confrelid
+             JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+             JOIN pg_catalog.pg_attribute ca ON ca.attrelid = cc.oid AND ca.attnum = con.conkey[1]
+             JOIN pg_catalog.pg_attribute pa ON pa.attrelid = pc.oid AND pa.attnum = con.confkey[1]
+             WHERE con.contype = 'f' AND array_length(con.conkey, 1) = 1",
+            &[],
+        )
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for r in rows {
+        let cs: String = r.get(0);
+        let ct: String = r.get(1);
+        let cc: String = r.get(2);
+        let ps: String = r.get(3);
+        let pt: String = r.get(4);
+        let pc: String = r.get(5);
+        if schemas.is_empty()
+            || (schemas.iter().any(|s| s.eq_ignore_ascii_case(&cs))
+                && schemas.iter().any(|s| s.eq_ignore_ascii_case(&ps)))
+        {
+            out.push(FkEdge {
+                child_table: format!("{cs}.{ct}"),
+                child_col: cc,
+                parent_table: format!("{ps}.{pt}"),
+                parent_col: pc,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn pg_apply_constraints_and_indexes(
+    src_tx: &mut postgres::Transaction,
+    dst: &mut PgClient,
+    ordered_qnames: &[String],
+    table_split: &HashMap<String, (String, String)>,
+) -> Result<()> {
+    let mut deferred_fks: Vec<String> = Vec::new();
+
+    for qname in ordered_qnames {
+        let (sch, tbl) = &table_split[qname];
+
+        // 1. Primary Key & Unique constraints
+        let cons = src_tx
+            .query(
+                "SELECT con.conname, con.contype::text, pg_catalog.pg_get_constraintdef(con.oid)
+                 FROM pg_catalog.pg_constraint con
+                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p', 'u', 'f')
+                 ORDER BY CASE con.contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 ELSE 2 END, con.conname",
+                &[sch, tbl],
+            )
+            .unwrap_or_default();
+
+        for r in cons {
+            let cname: String = r.get(0);
+            let ctype: String = r.get(1);
+            let cdef: String = r.get(2);
+            let stmt = format!(
+                "ALTER TABLE {}.{} ADD CONSTRAINT {} {};",
+                qid(sch),
+                qid(tbl),
+                qid(&cname),
+                cdef
+            );
+            if ctype == "f" {
+                deferred_fks.push(stmt);
+            } else {
+                let _ = dst.batch_execute(&stmt);
+            }
+        }
+
+        // 2. Non-constraint secondary indexes
+        let idxs = src_tx
+            .query(
+                "SELECT pg_catalog.pg_get_indexdef(i.indexrelid)
+                 FROM pg_catalog.pg_index i
+                 JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 LEFT JOIN pg_catalog.pg_constraint con ON con.conindid = i.indexrelid
+                 WHERE n.nspname = $1 AND c.relname = $2 AND con.oid IS NULL",
+                &[sch, tbl],
+            )
+            .unwrap_or_default();
+        for r in idxs {
+            let idef: String = r.get(0);
+            let _ = dst.batch_execute(&idef);
+        }
+
+        // 3. Preserve serial / identity sequences if present
+        let seq_cols = src_tx
+            .query(
+                "SELECT a.attname, pg_catalog.pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname)
+                 FROM pg_catalog.pg_attribute a
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+                &[sch, tbl],
+            )
+            .unwrap_or_default();
+        for r in seq_cols {
+            let col: String = r.get(0);
+            let seq: Option<String> = r.get(1);
+            if seq.is_some() {
+                let seq_name = format!("{tbl}_{col}_seq");
+                let _ = dst.batch_execute(&format!(
+                    "CREATE SEQUENCE IF NOT EXISTS {}.{};
+                     ALTER TABLE {}.{} ALTER COLUMN {} SET DEFAULT nextval('{}.{}');
+                     SELECT setval('{}.{}', COALESCE((SELECT MAX({}) FROM {}.{}), 1), true);",
+                    qid(sch),
+                    qid(&seq_name),
+                    qid(sch),
+                    qid(tbl),
+                    qid(&col),
+                    sch,
+                    seq_name,
+                    sch,
+                    seq_name,
+                    qid(&col),
+                    qid(sch),
+                    qid(tbl)
+                ));
+            }
+        }
+    }
+
+    // 4. Apply FKs AFTER all tables & PKs are populated!
+    for fk_stmt in deferred_fks {
+        let _ = dst.batch_execute(&fk_stmt);
+    }
+    Ok(())
+}
+
+// ── VERIFY (Zero-Leak PII Audit + Embedded PII Check + Row/Cardinality Parity) ──
 
 pub fn verify_masking(
     original: &str,
     masked: &str,
     config: Option<&MaskConfig>,
     schemas: &[String],
+    allow_subset: bool,
 ) -> Result<VerifyReport> {
     if is_sqlite(original) && is_sqlite(masked) {
-        verify_sqlite(original, masked, config)
+        verify_sqlite(original, masked, config, allow_subset)
     } else if is_pg(original) && is_pg(masked) {
-        verify_postgres(original, masked, config, schemas)
+        verify_postgres(original, masked, config, schemas, allow_subset)
+    } else if is_parquet(original) && is_parquet(masked) {
+        verify_parquet(original, masked, config, allow_subset)
     } else if original.to_ascii_lowercase().ends_with(".csv")
         && masked.to_ascii_lowercase().ends_with(".csv")
     {
-        verify_csv(original, masked, config)
+        verify_csv(original, masked, config, allow_subset)
     } else {
         Err(MaskkeelError::config(
             format!("Unsupported verify pair `{original}` vs `{masked}`"),
-            "Compare CSV vs CSV, SQLite vs SQLite, or PostgreSQL vs PostgreSQL.",
+            "Compare CSV vs CSV, Parquet vs Parquet, SQLite vs SQLite, or PostgreSQL vs PostgreSQL.",
         ))
     }
 }
 
-fn verify_csv(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<VerifyReport> {
+fn count_leaks(
+    orig_vals: &HashSet<String>,
+    mask_vals: &HashSet<String>,
+    is_text_redact: bool,
+) -> usize {
+    if is_text_redact {
+        let o_toks: HashSet<String> = orig_vals
+            .iter()
+            .flat_map(|s| extract_embedded_pii_tokens(s))
+            .collect();
+        let m_toks: HashSet<String> = mask_vals
+            .iter()
+            .flat_map(|s| extract_embedded_pii_tokens(s))
+            .collect();
+        o_toks.intersection(&m_toks).count()
+    } else {
+        orig_vals.intersection(mask_vals).count()
+    }
+}
+
+fn verify_csv(
+    orig: &str,
+    msk: &str,
+    config: Option<&MaskConfig>,
+    allow_subset: bool,
+) -> Result<VerifyReport> {
     let tname = Path::new(orig)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("dataset");
     let detected = scan_delimited(orig, b',', tname, 500)?;
-    let pii_cols: HashSet<String> = detected
+    let mut pii_cols: HashMap<String, MaskStrategy> = detected
         .iter()
-        .map(|d| d.column.to_ascii_lowercase())
-        .chain(
-            config
-                .map(|c| {
-                    c.columns
-                        .iter()
-                        .filter(|(_, s)| **s != MaskStrategy::Keep)
-                        .map(|(k, _)| k.to_ascii_lowercase())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-        )
+        .map(|d| (d.column.to_ascii_lowercase(), d.recommended_strategy))
         .collect();
+    if let Some(cfg) = config {
+        for (k, &s) in &cfg.columns {
+            if s == MaskStrategy::Keep {
+                pii_cols.remove(&k.to_ascii_lowercase());
+            } else {
+                pii_cols.insert(k.to_ascii_lowercase(), s);
+            }
+        }
+    }
 
     let (oh, orows) = read_csv_all(orig)?;
     let (mh, mrows) = read_csv_all(msk)?;
-    let row_counts_matched = orows.len() == mrows.len();
+    let row_counts_matched = if allow_subset {
+        mrows.len() <= orows.len() && (orows.is_empty() || !mrows.is_empty())
+    } else {
+        orows.len() == mrows.len()
+    };
     let mut key_cardinality_preserved = true;
     let mut leaks = Vec::new();
     let mut notes = Vec::new();
@@ -1073,13 +1579,17 @@ fn verify_csv(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<Veri
         ));
     }
 
+    let mut checked_cols = 0usize;
+    let mut table_leaks = 0usize;
+
     for (idx, col) in oh.iter().enumerate() {
         let Some(midx) = mh.iter().position(|c| c == col) else {
             continue;
         };
-        if !pii_cols.contains(&col.to_ascii_lowercase()) {
+        let Some(&strat) = pii_cols.get(&col.to_ascii_lowercase()) else {
             continue;
-        }
+        };
+        checked_cols += 1;
         let orig_vals: HashSet<String> = orows
             .iter()
             .filter_map(|r| r.get(idx))
@@ -1092,21 +1602,20 @@ fn verify_csv(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<Veri
             .map(|s| s.trim().to_string())
             .filter(|s| s.len() >= 3)
             .collect();
-        let is_key_col = detected.iter().any(|d| {
-            d.column.eq_ignore_ascii_case(col)
-                && matches!(
-                    d.recommended_strategy,
-                    MaskStrategy::Id
-                        | MaskStrategy::IntId
-                        | MaskStrategy::Email
-                        | MaskStrategy::Ssn
-                )
-        });
-        if is_key_col && orig_vals.len() != mask_vals.len() && !mask_vals.contains("[REDACTED]") {
+        let is_key_col = matches!(
+            strat,
+            MaskStrategy::Id | MaskStrategy::IntId | MaskStrategy::Email | MaskStrategy::Ssn
+        );
+        if !allow_subset
+            && is_key_col
+            && orig_vals.len() != mask_vals.len()
+            && !mask_vals.contains("[REDACTED]")
+        {
             key_cardinality_preserved = false;
         }
-        let leaked = orig_vals.intersection(&mask_vals).count();
+        let leaked = count_leaks(&orig_vals, &mask_vals, strat == MaskStrategy::TextRedact);
         if leaked > 0 {
+            table_leaks += leaked;
             leaks.push(LeakDetail {
                 table: tname.to_string(),
                 column: col.clone(),
@@ -1118,18 +1627,31 @@ fn verify_csv(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<Veri
     let pii_leaks_found: usize = leaks.iter().map(|l| l.leaked_count).sum();
     Ok(VerifyReport {
         ok: row_counts_matched && pii_leaks_found == 0,
+        verified_at: Utc::now().to_rfc3339(),
         original: orig.to_string(),
         masked: msk.to_string(),
         tables_checked: 1,
         row_counts_matched,
         key_cardinality_preserved,
         pii_leaks_found,
+        table_results: vec![TableVerifySummary {
+            table: tname.to_string(),
+            original_rows: orows.len(),
+            masked_rows: mrows.len(),
+            pii_columns_checked: checked_cols,
+            leaked_values: table_leaks,
+        }],
         leaks,
         notes,
     })
 }
 
-fn verify_sqlite(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<VerifyReport> {
+fn verify_sqlite(
+    orig: &str,
+    msk: &str,
+    config: Option<&MaskConfig>,
+    allow_subset: bool,
+) -> Result<VerifyReport> {
     let oc = SqliteConn::open_with_flags(sqlite_path(orig), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?;
     let mc = SqliteConn::open_with_flags(sqlite_path(msk), OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1140,73 +1662,93 @@ fn verify_sqlite(orig: &str, msk: &str, config: Option<&MaskConfig>) -> Result<V
     let mut key_cardinality_preserved = true;
     let mut leaks = Vec::new();
     let mut notes = Vec::new();
+    let mut table_results = Vec::new();
 
     for tbl in &tables {
-        let ocnt: i64 = oc
+        let ocnt: usize = oc
             .query_row(&format!("SELECT COUNT(*) FROM {}", qid(tbl)), [], |r| {
-                r.get(0)
+                r.get::<_, i64>(0)
             })
-            .unwrap_or(0);
-        let mcnt: i64 = mc
+            .unwrap_or(0)
+            .max(0) as usize;
+        let mcnt: usize = mc
             .query_row(&format!("SELECT COUNT(*) FROM {}", qid(tbl)), [], |r| {
-                r.get(0)
+                r.get::<_, i64>(0)
             })
-            .unwrap_or(-1);
-        if ocnt != mcnt {
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        let ok_cnt = if allow_subset {
+            mcnt <= ocnt
+        } else {
+            ocnt == mcnt
+        };
+        if !ok_cnt {
             row_counts_matched = false;
             notes.push(format!(
                 "`{tbl}` row count mismatch: original={ocnt}, masked={mcnt}"
             ));
         }
 
-        let pii_cols: HashSet<String> = scan
+        let mut pii_cols: HashMap<String, MaskStrategy> = scan
             .findings
             .iter()
             .filter(|f| f.table == *tbl)
-            .map(|f| f.column.clone())
+            .map(|f| (f.column.clone(), f.recommended_strategy))
             .collect();
-        for col in pii_cols {
-            if let Some(cfg) = config
-                && cfg.resolve_strategy(tbl, &col) == Some(MaskStrategy::Keep)
-            {
-                continue;
+        if let Some(cfg) = config {
+            for (cname, _) in sqlite_table_cols(&oc, tbl)? {
+                if let Some(s) = cfg.resolve_strategy(tbl, &cname) {
+                    if s == MaskStrategy::Keep {
+                        pii_cols.remove(&cname);
+                    } else {
+                        pii_cols.insert(cname, s);
+                    }
+                }
             }
-            let ov = sqlite_distinct_strs(&oc, tbl, &col, 2000);
-            let mv = sqlite_distinct_strs(&mc, tbl, &col, 2000);
-            let is_key_col = scan.findings.iter().any(|f| {
-                f.table == *tbl
-                    && f.column == col
-                    && matches!(
-                        f.recommended_strategy,
-                        MaskStrategy::Id
-                            | MaskStrategy::IntId
-                            | MaskStrategy::Email
-                            | MaskStrategy::Ssn
-                    )
-            });
-            if is_key_col && ov.len() != mv.len() && !mv.contains("[REDACTED]") {
+        }
+
+        let mut table_leaks = 0usize;
+        for (col, strat) in &pii_cols {
+            let ov = sqlite_distinct_strs(&oc, tbl, col, 2000);
+            let mv = sqlite_distinct_strs(&mc, tbl, col, 2000);
+            let is_key_col = matches!(
+                strat,
+                MaskStrategy::Id | MaskStrategy::IntId | MaskStrategy::Email | MaskStrategy::Ssn
+            );
+            if !allow_subset && is_key_col && ov.len() != mv.len() && !mv.contains("[REDACTED]") {
                 key_cardinality_preserved = false;
             }
-            let leaked = ov.intersection(&mv).count();
+            let leaked = count_leaks(&ov, &mv, *strat == MaskStrategy::TextRedact);
             if leaked > 0 {
+                table_leaks += leaked;
                 leaks.push(LeakDetail {
                     table: tbl.clone(),
-                    column: col,
+                    column: col.clone(),
                     leaked_count: leaked,
                 });
             }
         }
+        table_results.push(TableVerifySummary {
+            table: tbl.clone(),
+            original_rows: ocnt,
+            masked_rows: mcnt,
+            pii_columns_checked: pii_cols.len(),
+            leaked_values: table_leaks,
+        });
     }
 
     let pii_leaks_found: usize = leaks.iter().map(|l| l.leaked_count).sum();
     Ok(VerifyReport {
         ok: row_counts_matched && pii_leaks_found == 0,
+        verified_at: Utc::now().to_rfc3339(),
         original: orig.to_string(),
         masked: msk.to_string(),
         tables_checked: tables.len(),
         row_counts_matched,
         key_cardinality_preserved,
         pii_leaks_found,
+        table_results,
         leaks,
         notes,
     })
@@ -1217,6 +1759,7 @@ fn verify_postgres(
     msk_url: &str,
     config: Option<&MaskConfig>,
     schemas: &[String],
+    allow_subset: bool,
 ) -> Result<VerifyReport> {
     let scan = scan_postgres(orig_url, schemas, 500)?;
     let mut oc = connect_postgres(orig_url)?;
@@ -1237,55 +1780,79 @@ fn verify_postgres(
     let mut key_cardinality_preserved = true;
     let mut leaks = Vec::new();
     let mut notes = Vec::new();
+    let mut table_results = Vec::new();
 
     for (sch, tbl) in &tables {
         let qname = format!("{sch}.{tbl}");
         let q = format!("SELECT COUNT(*) FROM {}.{}", qid(sch), qid(tbl));
-        let ocnt: i64 = otx.query_one(&q, &[]).map(|r| r.get(0)).unwrap_or(0);
-        let mcnt: i64 = mtx.query_one(&q, &[]).map(|r| r.get(0)).unwrap_or(-1);
-        if ocnt != mcnt {
+        let ocnt: usize = otx
+            .query_one(&q, &[])
+            .map(|r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as usize;
+        let mcnt: usize = mtx
+            .query_one(&q, &[])
+            .map(|r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as usize;
+        let ok_cnt = if allow_subset {
+            mcnt <= ocnt
+        } else {
+            ocnt == mcnt
+        };
+        if !ok_cnt {
             row_counts_matched = false;
             notes.push(format!(
                 "`{qname}` row count mismatch: original={ocnt}, masked={mcnt}"
             ));
         }
-        let pii_cols: HashSet<String> = scan
+
+        let mut pii_cols: HashMap<String, MaskStrategy> = scan
             .findings
             .iter()
             .filter(|f| f.table == qname)
-            .map(|f| f.column.clone())
+            .map(|f| (f.column.clone(), f.recommended_strategy))
             .collect();
-        for col in pii_cols {
-            if let Some(cfg) = config
-                && cfg.resolve_strategy(&qname, &col) == Some(MaskStrategy::Keep)
-            {
-                continue;
+        if let Some(cfg) = config {
+            for (cname, _) in pg_table_cols(&mut otx, sch, tbl)? {
+                if let Some(s) = cfg.resolve_strategy(&qname, &cname) {
+                    if s == MaskStrategy::Keep {
+                        pii_cols.remove(&cname);
+                    } else {
+                        pii_cols.insert(cname, s);
+                    }
+                }
             }
-            let ov = pg_distinct_strs(&mut otx, sch, tbl, &col, 2000);
-            let mv = pg_distinct_strs(&mut mtx, sch, tbl, &col, 2000);
-            let is_key_col = scan.findings.iter().any(|f| {
-                f.table == qname
-                    && f.column == col
-                    && matches!(
-                        f.recommended_strategy,
-                        MaskStrategy::Id
-                            | MaskStrategy::IntId
-                            | MaskStrategy::Email
-                            | MaskStrategy::Ssn
-                    )
-            });
-            if is_key_col && ov.len() != mv.len() && !mv.contains("[REDACTED]") {
+        }
+
+        let mut table_leaks = 0usize;
+        for (col, strat) in &pii_cols {
+            let ov = pg_distinct_strs(&mut otx, sch, tbl, col, 2000);
+            let mv = pg_distinct_strs(&mut mtx, sch, tbl, col, 2000);
+            let is_key_col = matches!(
+                strat,
+                MaskStrategy::Id | MaskStrategy::IntId | MaskStrategy::Email | MaskStrategy::Ssn
+            );
+            if !allow_subset && is_key_col && ov.len() != mv.len() && !mv.contains("[REDACTED]") {
                 key_cardinality_preserved = false;
             }
-            let leaked = ov.intersection(&mv).count();
+            let leaked = count_leaks(&ov, &mv, *strat == MaskStrategy::TextRedact);
             if leaked > 0 {
+                table_leaks += leaked;
                 leaks.push(LeakDetail {
                     table: qname.clone(),
-                    column: col,
+                    column: col.clone(),
                     leaked_count: leaked,
                 });
             }
         }
+        table_results.push(TableVerifySummary {
+            table: qname,
+            original_rows: ocnt,
+            masked_rows: mcnt,
+            pii_columns_checked: pii_cols.len(),
+            leaked_values: table_leaks,
+        });
     }
     let _ = otx.rollback();
     let _ = mtx.rollback();
@@ -1293,12 +1860,14 @@ fn verify_postgres(
     let pii_leaks_found: usize = leaks.iter().map(|l| l.leaked_count).sum();
     Ok(VerifyReport {
         ok: row_counts_matched && pii_leaks_found == 0,
+        verified_at: Utc::now().to_rfc3339(),
         original: "postgres (original)".to_string(),
         masked: "postgres (masked)".to_string(),
         tables_checked: tables.len(),
         row_counts_matched,
         key_cardinality_preserved,
         pii_leaks_found,
+        table_results,
         leaks,
         notes,
     })
@@ -1337,6 +1906,20 @@ fn mask_json_val(
             .mask_str(s, strat)
             .map(serde_json::Value::String)
             .unwrap_or(serde_json::Value::Null),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            if strat == MaskStrategy::Keep {
+                v.clone()
+            } else if strat == MaskStrategy::Null {
+                serde_json::Value::Null
+            } else if strat == MaskStrategy::TextRedact {
+                engine.mask_json_recursive(v)
+            } else {
+                engine
+                    .mask_str(&v.to_string(), strat)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        }
         other => {
             if strat == MaskStrategy::Keep {
                 other.clone()

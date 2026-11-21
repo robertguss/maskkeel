@@ -8,10 +8,12 @@ Part of the [Keel Data Stack](https://github.com/robertguss/keel-stack).
 
 When building analytics, debugging tricky cross-system joins, or working with AI coding agents on **FERPA / HIPAA / PII** datasets, you want realistic dev/test fixtures that **preserve every join key, edge case, and distribution** — without ever leaking a single real student name, email, SSN, phone number, or ID.
 
-- **Deterministic Keyed HMAC-SHA256 (`--salt` / `MASKKEEL_SALT`)**: The exact same raw value + salt produces the exact same synthetic value across files, schemas, and databases.
+- **Deterministic Keyed HMAC-SHA256 (`--salt` / `MASKKEEL_SALT`)**: The exact same raw value + salt produces the exact same synthetic value across files, schemas, and databases (with a non-reversible `salt_fingerprint` for audit trails).
 - **Cross-Type & Leading-Zero Format Preservation**: `INTEGER 1001` (`int_id`), `TEXT "1001"` (`id`), and zero-padded `TEXT "001001"` (`id`) share the exact same numeric core hash (`8472`, `"8472"`, `"008472"`), keeping real cross-system joins like `LTRIM(c.sis_user_id, '0') = CAST(s.person_id AS TEXT)` **100% intact**.
+- **Free-Text & JSONB Embedded PII Redaction (`text_redact`)**: Automatically detects and deterministically scrubs emails, SSNs, phones, and IPv4s hidden inside unstructured notes, Canvas comments, and Postgres `JSON`/`JSONB` columns.
+- **FK-Coherent Subsetting (`--limit` / `--sample`) & Postgres Structure Preservation**: Shrink giant production databases into fast, referentially-intact dev mirrors while preserving Postgres PKs, UNIQUEs, secondary indexes, FKs, and identity/serial sequences (`setval`).
+- **Native Parquet → Parquet + Offline Compliance Receipts**: Streams ZSTD-compressed Parquet outputs and emits standalone `--html compliance-receipt.html` audit reports via `maskkeel verify`.
 - **Read-Only Source Safety**: Refuses in-place overwrites (`E_UNSAFE_INPLACE`) and streams PostgreSQL sources inside `READ ONLY` transactions into target databases via `COPY`.
-- **Zero-Leak Audit (`maskkeel verify`)**: Proves `0` original PII values leaked, row counts match, and identifier cardinalities are preserved (exits `1` on any leak).
 - **DX + AX Native**: `--format auto|human|agent|json`, strict `stdout`/`stderr` separation, stable error codes + `fix_hint`, and bundled `maskkeel skill`.
 
 ## Install

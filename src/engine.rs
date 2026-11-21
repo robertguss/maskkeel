@@ -22,6 +22,7 @@ pub enum MaskStrategy {
     DateShift,
     Ip,
     Hash,
+    TextRedact,
     Redact,
     Null,
     Keep,
@@ -42,6 +43,7 @@ impl MaskStrategy {
             Self::DateShift => "date_shift",
             Self::Ip => "ip",
             Self::Hash => "hash",
+            Self::TextRedact => "text_redact",
             Self::Redact => "redact",
             Self::Null => "null",
             Self::Keep => "keep",
@@ -159,6 +161,95 @@ impl MaskEngine {
             email_domain: email_domain.unwrap_or("example.edu").to_string(),
             date_shift_days: date_shift_days.max(1),
         }
+    }
+
+    /// Non-reversible 12-hex fingerprint of the active salt (safe to log in compliance receipts).
+    pub fn salt_fingerprint(&self) -> String {
+        let h = self.hmac_bytes("salt_fingerprint", "maskkeel-v2");
+        let mut out = String::with_capacity(12);
+        for b in &h[..6] {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
+    /// Deterministically scrub embedded emails, SSNs, phone numbers, and IPv4s inside free-text prose or notes.
+    pub fn mask_free_text(&self, text: &str) -> String {
+        let re = pii_regexes();
+        let s1 = re.email_inline.replace_all(text, |caps: &regex::Captures| {
+            self.mask_str(&caps[0], MaskStrategy::Email)
+                .unwrap_or_else(|| "[EMAIL]".to_string())
+        });
+        let s2 = re.ssn_inline.replace_all(&s1, |caps: &regex::Captures| {
+            self.mask_str(&caps[0], MaskStrategy::Ssn)
+                .unwrap_or_else(|| "[SSN]".to_string())
+        });
+        let s3 = re.phone_inline.replace_all(&s2, |caps: &regex::Captures| {
+            self.mask_str(&caps[0], MaskStrategy::Phone)
+                .unwrap_or_else(|| "[PHONE]".to_string())
+        });
+        let s4 = re.ipv4_inline.replace_all(&s3, |caps: &regex::Captures| {
+            self.mask_str(&caps[0], MaskStrategy::Ip)
+                .unwrap_or_else(|| "[IP]".to_string())
+        });
+        s4.into_owned()
+    }
+
+    /// Recursively scrub nested JSON objects/arrays (e.g. Postgres JSONB columns or nested JSONL).
+    pub fn mask_json_recursive(&self, val: &serde_json::Value) -> serde_json::Value {
+        match val {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                val.clone()
+            }
+            serde_json::Value::String(s) => serde_json::Value::String(self.mask_free_text(s)),
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(|v| self.mask_json_recursive(v)).collect())
+            }
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, v) in map {
+                    let masked_v = match v {
+                        serde_json::Value::String(s) => {
+                            if let Some(det) = detect_column_pii(k, std::slice::from_ref(s), false)
+                                && det.recommended_strategy != MaskStrategy::TextRedact
+                            {
+                                self.mask_str(s, det.recommended_strategy)
+                                    .map(serde_json::Value::String)
+                                    .unwrap_or(serde_json::Value::Null)
+                            } else {
+                                serde_json::Value::String(self.mask_free_text(s))
+                            }
+                        }
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64()
+                                && let Some(det) = detect_column_pii(k, &[i.to_string()], true)
+                                && matches!(
+                                    det.recommended_strategy,
+                                    MaskStrategy::IntId | MaskStrategy::Id
+                                )
+                            {
+                                self.mask_i64(i, det.recommended_strategy)
+                                    .map(|m| serde_json::json!(m))
+                                    .unwrap_or(serde_json::Value::Null)
+                            } else {
+                                v.clone()
+                            }
+                        }
+                        other => self.mask_json_recursive(other),
+                    };
+                    out.insert(k.clone(), masked_v);
+                }
+                serde_json::Value::Object(out)
+            }
+        }
+    }
+
+    /// Deterministic day-offset for `DateShift` (shared by ISO string dates and Arrow `Date32`).
+    pub fn date_shift_offset(&self, key: &str) -> i64 {
+        let h = self.hmac_bytes("date_shift", key);
+        let span = (self.date_shift_days * 2 + 1) as u64;
+        let offset = (Self::u64_from(&h, 0) % span) as i64 - self.date_shift_days;
+        if offset == 0 { 7 } else { offset }
     }
 
     fn hmac_bytes(&self, domain_tag: &str, input: &str) -> [u8; 32] {
@@ -322,10 +413,7 @@ impl MaskEngine {
                 Some(format!("{num} {st}"))
             }
             MaskStrategy::DateShift => {
-                let h = self.hmac_bytes("date_shift", norm_key);
-                let span = (self.date_shift_days * 2 + 1) as u64;
-                let offset = (Self::u64_from(&h, 0) % span) as i64 - self.date_shift_days;
-                let offset = if offset == 0 { 7 } else { offset };
+                let offset = self.date_shift_offset(norm_key);
                 if norm_key.len() >= 10
                     && let Ok(date) = NaiveDate::parse_from_str(&norm_key[..10], "%Y-%m-%d")
                 {
@@ -334,6 +422,7 @@ impl MaskEngine {
                     return Some(format!("{}{suffix}", shifted.format("%Y-%m-%d")));
                 }
                 // Fallback if non-ISO date format
+                let h = self.hmac_bytes("date_shift", norm_key);
                 Some(format!("1990-01-{:02}", 1 + (Self::u64_from(&h, 0) % 28)))
             }
             MaskStrategy::Ip => {
@@ -350,6 +439,7 @@ impl MaskEngine {
                 }
                 Some(hex)
             }
+            MaskStrategy::TextRedact => Some(self.mask_free_text(raw)),
             MaskStrategy::Keep | MaskStrategy::Null | MaskStrategy::Redact => unreachable!(),
         }
     }
@@ -387,7 +477,10 @@ struct PiiRegexes {
     ssn: Regex,
     phone: Regex,
     ipv4: Regex,
-    iso_date: Regex,
+    email_inline: Regex,
+    ssn_inline: Regex,
+    phone_inline: Regex,
+    ipv4_inline: Regex,
 }
 
 fn pii_regexes() -> &'static PiiRegexes {
@@ -397,8 +490,31 @@ fn pii_regexes() -> &'static PiiRegexes {
         ssn: Regex::new(r"^\d{3}-\d{2}-\d{4}$").unwrap(),
         phone: Regex::new(r"^(\+?1[-.\s]?)?(\(\d{3}\)|\d{3})[-.\s]\d{3}[-.\s]\d{4}$").unwrap(),
         ipv4: Regex::new(r"^(?:\d{1,3}\.){3}\d{1,3}$").unwrap(),
-        iso_date: Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap(),
+        email_inline: Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b").unwrap(),
+        ssn_inline: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
+        phone_inline: Regex::new(r"(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\b\d{3})[-.\s]\d{3}[-.\s]\d{4}\b")
+            .unwrap(),
+        ipv4_inline: Regex::new(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
+        )
+        .unwrap(),
     })
+}
+
+/// Extract embedded PII tokens (emails, SSNs, phones) inside unstructured strings for zero-leak verification.
+pub fn extract_embedded_pii_tokens(text: &str) -> Vec<String> {
+    let re = pii_regexes();
+    let mut out = Vec::new();
+    for m in re.email_inline.find_iter(text) {
+        out.push(m.as_str().to_ascii_lowercase());
+    }
+    for m in re.ssn_inline.find_iter(text) {
+        out.push(m.as_str().to_string());
+    }
+    for m in re.phone_inline.find_iter(text) {
+        out.push(m.as_str().to_string());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,6 +698,27 @@ pub fn detect_column_pii(
         });
     }
 
-    let _ = &re.iso_date;
+    // 3. Embedded PII inside unstructured free-text, notes, comments, or JSON/JSONB blobs!
+    if total > 0 {
+        let embedded_hits = non_empty
+            .iter()
+            .filter(|s| {
+                re.email_inline.is_match(s)
+                    || re.ssn_inline.is_match(s)
+                    || re.phone_inline.is_match(s)
+            })
+            .count();
+        if embedded_hits > 0 {
+            return Some(PiiDetection {
+                pii_type: "embedded_pii".to_string(),
+                recommended_strategy: MaskStrategy::TextRedact,
+                confidence: "high".to_string(),
+                reason: format!(
+                    "{embedded_hits}/{total} sampled values contain embedded email/SSN/phone inside free-text or JSON"
+                ),
+            });
+        }
+    }
+
     None
 }

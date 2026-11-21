@@ -346,3 +346,242 @@ fn test_jsonl_masking_and_skill_install() {
         .success();
     assert!(skill_dir.join("SKILL.md").exists());
 }
+
+#[test]
+fn test_text_redact_embedded_pii_and_html_receipt() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("advisor_notes.csv");
+    let dst = dir.path().join("advisor_notes_masked.csv");
+    let html_path = dir.path().join("compliance-receipt.html");
+
+    fs::write(
+        &src,
+        "person_id,email,advisor_note\n\
+         1001,alice@wts.edu,\"Spoke with student at alice@wts.edu; SSN 123-45-6789; callback (215) 555-8899\"\n\
+         1002,bob@wts.edu,\"Follow up with bob@wts.edu from 10.20.30.40 regarding registration\"\n",
+    )
+    .unwrap();
+
+    // Scan should auto-detect `advisor_note` as embedded_pii -> text_redact
+    let scan_out = maskkeel_cmd()
+        .args(["scan", src.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let scan_json: Value = serde_json::from_slice(&scan_out).unwrap();
+    let findings = scan_json["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| {
+            f["column"] == "advisor_note" && f["recommended_strategy"] == "text_redact"
+        }),
+        "Expected advisor_note to be auto-detected as text_redact: {scan_json}"
+    );
+
+    maskkeel_cmd()
+        .args([
+            "mask",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            "--salt",
+            "ferpa-notes-salt",
+        ])
+        .assert()
+        .success();
+
+    let masked = fs::read_to_string(&dst).unwrap();
+    assert!(!masked.contains("alice@wts.edu"));
+    assert!(!masked.contains("123-45-6789"));
+    assert!(!masked.contains("(215) 555-8899"));
+    assert!(!masked.contains("10.20.30.40"));
+    assert!(masked.contains("Spoke with student at "));
+    assert!(masked.contains("regarding registration"));
+
+    // Verify embedded email inside advisor_note matches the masked email column!
+    let row1: Vec<&str> = masked.lines().nth(1).unwrap().splitn(3, ',').collect();
+    let masked_email = row1[1];
+    let masked_note = row1[2];
+    assert!(
+        masked_note.contains(masked_email),
+        "Embedded email in note ({masked_note}) must match masked email column ({masked_email})!"
+    );
+
+    // Verify with offline HTML compliance receipt
+    maskkeel_cmd()
+        .args([
+            "verify",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            "--html",
+            html_path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+    let html_body = fs::read_to_string(&html_path).unwrap();
+    assert!(html_body.contains("PASS — ZERO PII LEAKS"));
+    assert!(html_body.contains("advisor_notes"));
+}
+
+#[test]
+fn test_sqlite_fk_coherent_subsetting_limit() {
+    let dir = tempdir().unwrap();
+    let src_db = dir.path().join("big_prod.db");
+    let dst_db = dir.path().join("tiny_dev.db");
+
+    {
+        let conn = Connection::open(&src_db).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE students (
+                 person_id INTEGER PRIMARY KEY,
+                 email TEXT NOT NULL,
+                 first_name TEXT NOT NULL
+             );
+             CREATE TABLE enrollments (
+                 id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL REFERENCES students(person_id),
+                 course TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        for i in 1..=20 {
+            let pid = 1000 + i;
+            conn.execute(
+                "INSERT INTO students VALUES (?1, ?2, ?3)",
+                rusqlite::params![pid, format!("user{i}@wts.edu"), format!("Student{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO enrollments VALUES (?1, ?2, 'NT101')",
+                rusqlite::params![i * 2 - 1, pid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO enrollments VALUES (?1, ?2, 'OT101')",
+                rusqlite::params![i * 2, pid],
+            )
+            .unwrap();
+        }
+    }
+
+    // Mask with --limit 5 -> should keep 5 students and ONLY their 10 coherent enrollments (0 orphans!)
+    maskkeel_cmd()
+        .args([
+            "mask",
+            src_db.to_str().unwrap(),
+            dst_db.to_str().unwrap(),
+            "--limit",
+            "5",
+            "--salt",
+            "subset-secret",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let dev = Connection::open(&dst_db).unwrap();
+    let student_cnt: i64 = dev
+        .query_row("SELECT COUNT(*) FROM students", [], |r| r.get(0))
+        .unwrap();
+    let enroll_cnt: i64 = dev
+        .query_row("SELECT COUNT(*) FROM enrollments", [], |r| r.get(0))
+        .unwrap();
+    let orphan_cnt: i64 = dev
+        .query_row(
+            "SELECT COUNT(*) FROM enrollments e LEFT JOIN students s ON s.person_id = e.person_id WHERE s.person_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(student_cnt, 5);
+    assert_eq!(enroll_cnt, 10);
+    assert_eq!(
+        orphan_cnt, 0,
+        "FK-coherent subsetting must leave ZERO orphan child rows!"
+    );
+
+    // Verify with --allow-subset passes with 0 leaks!
+    maskkeel_cmd()
+        .args([
+            "verify",
+            src_db.to_str().unwrap(),
+            dst_db.to_str().unwrap(),
+            "--allow-subset",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_native_parquet_to_parquet_mask_and_verify() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let src_pq = dir.path().join("students.parquet");
+    let dst_pq = dir.path().join("students_masked.parquet");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("person_id", DataType::Int64, false),
+        Field::new("email", DataType::Utf8, false),
+        Field::new("advisor_note", DataType::Utf8, false),
+        Field::new("program", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1001, 1002])),
+            Arc::new(StringArray::from(vec!["alice@wts.edu", "bob@wts.edu"])),
+            Arc::new(StringArray::from(vec![
+                "Call alice@wts.edu re: SSN 123-45-6789",
+                "Met with bob@wts.edu yesterday",
+            ])),
+            Arc::new(StringArray::from(vec!["MDiv", "MAR"])),
+        ],
+    )
+    .unwrap();
+    let f = fs::File::create(&src_pq).unwrap();
+    let mut writer = ArrowWriter::try_new(f, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    maskkeel_cmd()
+        .args([
+            "mask",
+            src_pq.to_str().unwrap(),
+            dst_pq.to_str().unwrap(),
+            "--salt",
+            "parquet-secret",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let v_out = maskkeel_cmd()
+        .args([
+            "verify",
+            src_pq.to_str().unwrap(),
+            dst_pq.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v_json: Value = serde_json::from_slice(&v_out).unwrap();
+    assert_eq!(v_json["ok"], true);
+    assert_eq!(v_json["pii_leaks_found"], 0);
+    assert_eq!(v_json["row_counts_matched"], true);
+}
