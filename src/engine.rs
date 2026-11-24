@@ -590,7 +590,7 @@ pub fn detect_column_pii(
             reason: format!("Column name `{col_name}` indicates SSN/tax identifier"),
         });
     }
-    if n.contains("email") || n == "e_mail" {
+    if (n.contains("email") || n == "e_mail") && !n.ends_with("_id") {
         return Some(PiiDetection {
             pii_type: "email".to_string(),
             recommended_strategy: MaskStrategy::Email,
@@ -598,7 +598,9 @@ pub fn detect_column_pii(
             reason: format!("Column name `{col_name}` indicates email address"),
         });
     }
-    if n.contains("phone") || n.contains("mobile") || n == "cell" || n.contains("tel_") {
+    if (n.contains("phone") || n.contains("mobile") || n == "cell" || n.contains("tel_"))
+        && !n.ends_with("_id")
+    {
         return Some(PiiDetection {
             pii_type: "phone".to_string(),
             recommended_strategy: MaskStrategy::Phone,
@@ -721,4 +723,52 @@ pub fn detect_column_pii(
     }
 
     None
+}
+
+const NON_PERSON_TABLES: &[&str] = &[
+    "academic_terms",
+    "academic_years",
+    "terms",
+    "enrollment_terms",
+    "courses",
+    "catalog_courses",
+    "course_offerings",
+    "campuses",
+    "programs",
+    "degrees",
+    "departments",
+    "schools",
+    "roles",
+    "sections",
+    "exit_reasons",
+    "grade_scales",
+    "grade_points",
+    "aid_types",
+    "statuses",
+    "types",
+    "categories",
+];
+
+/// Table-aware wrapper around [`detect_column_pii`] that avoids flagging generic label columns
+/// (such as `display_name` or `short_name`) on non-person lookup/reference tables like `academic_terms`.
+pub fn detect_table_column_pii(
+    table_name: &str,
+    col_name: &str,
+    samples: &[String],
+    is_integer_col: bool,
+) -> Option<PiiDetection> {
+    let det = detect_column_pii(col_name, samples, is_integer_col)?;
+    let col_low = col_name.to_ascii_lowercase();
+    if matches!(col_low.as_str(), "display_name" | "short_name") && det.pii_type == "full_name" {
+        let short_tbl = table_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(table_name)
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        if NON_PERSON_TABLES.contains(&short_tbl.as_str()) {
+            return None;
+        }
+    }
+    Some(det)
 }

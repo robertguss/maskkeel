@@ -1,5 +1,7 @@
 use crate::config::{MaskConfig, ScannedColumn, detection_to_scanned};
-use crate::engine::{MaskEngine, MaskStrategy, detect_column_pii, extract_embedded_pii_tokens};
+use crate::engine::{
+    MaskEngine, MaskStrategy, detect_table_column_pii, extract_embedded_pii_tokens,
+};
 use crate::error::{MaskkeelError, Result};
 use crate::parquet_io::{mask_parquet_to_parquet, verify_parquet};
 use chrono::Utc;
@@ -239,7 +241,7 @@ fn scan_delimited(path: &str, delim: u8, tname: &str, limit: usize) -> Result<Ve
     }
     let mut findings = Vec::new();
     for (col, vals) in headers.iter().zip(samples.iter()) {
-        if let Some(d) = detect_column_pii(col, vals, false) {
+        if let Some(d) = detect_table_column_pii(tname, col, vals, false) {
             findings.push(detection_to_scanned(tname, col, d));
         }
     }
@@ -290,7 +292,7 @@ fn scan_jsonl(path: &str, tname: &str, limit: usize) -> Result<Vec<ScannedColumn
     for c in cols {
         let vals = samples.get(&c).cloned().unwrap_or_default();
         let is_int = *int_flags.get(&c).unwrap_or(&false) && !vals.is_empty();
-        if let Some(d) = detect_column_pii(&c, &vals, is_int) {
+        if let Some(d) = detect_table_column_pii(tname, &c, &vals, is_int) {
             findings.push(detection_to_scanned(tname, &c, d));
         }
     }
@@ -334,7 +336,7 @@ pub fn scan_parquet(path: &str, tname: &str, limit: usize) -> Result<Vec<Scanned
     }
     let mut findings = Vec::new();
     for ((col, is_int), vals) in cols.iter().zip(samples.iter()) {
-        if let Some(d) = detect_column_pii(col, vals, *is_int) {
+        if let Some(d) = detect_table_column_pii(tname, col, vals, *is_int) {
             findings.push(detection_to_scanned(tname, col, d));
         }
     }
@@ -364,7 +366,7 @@ fn scan_sqlite(source: &str, limit: usize) -> Result<ScanReport> {
                 .map_err(|e| MaskkeelError::db(e.to_string(), "", false))?
                 .filter_map(|r| r.ok())
                 .collect();
-            if let Some(d) = detect_column_pii(&cname, &vals, is_int) {
+            if let Some(d) = detect_table_column_pii(tbl, &cname, &vals, is_int) {
                 findings.push(detection_to_scanned(tbl, &cname, d));
             }
         }
@@ -407,7 +409,7 @@ fn scan_postgres(db_url: &str, schemas: &[String], limit: usize) -> Result<ScanR
                 .into_iter()
                 .map(|r| r.get::<_, String>(0))
                 .collect();
-            if let Some(d) = detect_column_pii(&cname, &vals, is_int) {
+            if let Some(d) = detect_table_column_pii(&qname, &cname, &vals, is_int) {
                 findings.push(detection_to_scanned(&qname, &cname, d));
             }
         }
